@@ -23,7 +23,7 @@ import lib.test  # pylint: disable=C0413
 import lib.time  # pylint: disable=C0413
 import lib.txt  # pylint: disable=C0413
 from lib.globals import (STATE_OK, STATE_UNKNOWN,  # pylint: disable=C0413
-                          STATE_WARN)
+                          STATE_WARN, STATE_CRIT)
 
 try:
     import vici  # pylint: disable=C0413
@@ -61,6 +61,13 @@ def parse_args():
         dest='ALWAYS_OK',
         action='store_true',
         default=False,
+    )
+
+    parser.add_argument(
+        '--connection',
+        help='Name of connection to check',
+        dest='CONNECTION',
+        default=None,
     )
 
     parser.add_argument(
@@ -256,8 +263,10 @@ def main():
     state = STATE_OK
     perfdata = ''
     table_data = []
+    child_sa_found = False
+    sa_found = False
 
-    if possible_connection_keys != active_connection_keys:
+    if possible_connection_keys != active_connection_keys and args.CONNECTION == None:
         conf_state = STATE_WARN
         state = lib.base.get_worst(state, conf_state)
         msg += 'One or more connections are configured but not active{}. '.format(
@@ -272,8 +281,11 @@ def main():
             except:
                 continue
             row['conn'] = key
-            perfdata += lib.base.get_perfdata('{}_established'.format(key), row['established'], 's', None, None, 0, None)
-            perfdata += lib.base.get_perfdata('{}_rekey-time'.format(key), row['rekey-time'], 's', None, None, 0, None)
+            # only add ike perfdata if needed
+            if args.CONNECTION == None or args.CONNECTION == key:
+                sa_found = True
+                perfdata += lib.base.get_perfdata('{}_established'.format(key), row['established'], 's', None, None, 0, None)
+                perfdata += lib.base.get_perfdata('{}_rekey-time'.format(key), row['rekey-time'], 's', None, None, 0, None)
 
             children = None
             try:
@@ -286,24 +298,46 @@ def main():
             if children is not None:
                 for child_key in children:
                     child_row = format_child_data(children[child_key])
-                    # combine two dictionaries using dictionary comprehension
-                    table_data.append({k:v for d in (row, child_row) for k,v in d.items()})
-                    perfdata += lib.base.get_perfdata('{}_{}_bytes-in'.format(key, child_row['child-name']), child_row['child-bytes-in'], 'B', None, None, 0, None)
-                    perfdata += lib.base.get_perfdata('{}_{}_bytes-out'.format(key, child_row['child-name']), child_row['child-bytes-out'], 'B', None, None, 0, None)
-                    perfdata += lib.base.get_perfdata('{}_{}_install-time'.format(key, child_row['child-name']), child_row['child-install-time'], 's', None, None, 0, None)
-                    perfdata += lib.base.get_perfdata('{}_{}_life-time'.format(key, child_row['child-name']), child_row['child-life-time'], 's', None, None, 0, None)
-                    perfdata += lib.base.get_perfdata('{}_{}_rekey-time'.format(key, child_row['child-name']), child_row['child-rekey-time'], 's', None, None, 0, None)
+                    if args.CONNECTION is not None and not args.CONNECTION == key:
+                        if not child_key.startswith(args.CONNECTION + '-') and sa_found == False:
+                            continue
+                        else:
+                            if child_row['child-mode-state'] == 'TUNNEL:INSTALLED':
+                                child_sa_found = True
+                    if args.CONNECTION == None or args.CONNECTION == key or (args.CONNECTION is not None and child_key.startswith(args.CONNECTION + '-')):
+                        # combine two dictionaries using dictionary comprehension
+                        table_data.append({k:v for d in (row, child_row) for k,v in d.items()})
+                        # only add perfdata for the child sa that is in INSTALLED state so as to avoid duplicates
+                        if child_row['child-mode-state'] == 'TUNNEL:INSTALLED':
+                            perfdata += lib.base.get_perfdata('{}_{}_bytes-in'.format(key, child_row['child-name']), child_row['child-bytes-in'], 'B', None, None, 0, None)
+                            perfdata += lib.base.get_perfdata('{}_{}_bytes-out'.format(key, child_row['child-name']), child_row['child-bytes-out'], 'B', None, None, 0, None)
+                            perfdata += lib.base.get_perfdata('{}_{}_install-time'.format(key, child_row['child-name']), child_row['child-install-time'], 's', None, None, 0, None)
+                            perfdata += lib.base.get_perfdata('{}_{}_life-time'.format(key, child_row['child-name']), child_row['child-life-time'], 's', None, None, 0, None)
+                            perfdata += lib.base.get_perfdata('{}_{}_rekey-time'.format(key, child_row['child-name']), child_row['child-rekey-time'], 's', None, None, 0, None)
+                    # only add ike perfdata if child sa is up when matching connection and not already added above
+                    if args.CONNECTION is not None and child_key.startswith(args.CONNECTION + '-') and not args.CONNECTION == key:
+                        perfdata += lib.base.get_perfdata('{}_established'.format(key), row['established'], 's', None, None, 0, None)
+                        perfdata += lib.base.get_perfdata('{}_rekey-time'.format(key), row['rekey-time'], 's', None, None, 0, None)
             else:
-                child_state = STATE_WARN
+                if args.CONNECTION is not None and sa_found == False:
+                    # if we are matching a connection it is critical if not found
+                    child_state = STATE_CRIT
+                else:
+                    child_state = STATE_WARN
                 state = lib.base.get_worst(state, child_state)
                 msg += '{} not connected at child level{}. '.format(
                     key,
                     lib.base.state2str(child_state, prefix=' '),
                 )
+    if args.CONNECTION is not None and child_sa_found == False and sa_found==False:
+        state = STATE_CRIT
 
     # build the message
     if state == STATE_OK:
         msg = 'Everything is ok.'
+
+    if state == STATE_CRIT:
+        msg = 'CRITICAL: Connection is down/not configured.'
 
     # over and out
     if table_data:
